@@ -1,0 +1,75 @@
+name: Sync Issues to Private Repo
+
+on:
+  issues:
+    types: [opened, edited, closed, reopened, labeled, unlabeled]
+  issue_comment:
+    types: [created, edited]
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Mirror issue to private repo
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.PRIVATE_REPO_PAT }}
+          script: |
+            const private_owner = context.repo.owner;
+            const private_repo = 'typed_graph';
+            const { issue, comment } = context.payload;
+
+            const mirror_tag = `[Public #${issue.number}]`;
+
+            async function find_mirrored_issue() {
+              const result = await github.rest.search.issuesAndPullRequests({
+                q: `${mirror_tag} repo:${private_owner}/${private_repo} is:issue in:title`
+              });
+              return result.data.total_count > 0 ? result.data.items[0] : null;
+            }
+
+            if (context.eventName === 'issues') {
+              const body = [
+                `> Mirrored from public issue [#${issue.number}](${issue.html_url}) by [@${issue.user.login}](${issue.user.html_url})`,
+                '',
+                issue.body || ''
+              ].join('\n');
+
+              const mirrored = await find_mirrored_issue();
+
+              if (!mirrored) {
+                await github.rest.issues.create({
+                  owner: private_owner,
+                  repo: private_repo,
+                  title: `${mirror_tag} ${issue.title}`,
+                  body,
+                  labels: issue.labels.map(l => l.name)
+                });
+              } else {
+                await github.rest.issues.update({
+                  owner: private_owner,
+                  repo: private_repo,
+                  issue_number: mirrored.number,
+                  title: `${mirror_tag} ${issue.title}`,
+                  body,
+                  state: issue.state,
+                  labels: issue.labels.map(l => l.name)
+                });
+              }
+            }
+
+            if (context.eventName === 'issue_comment') {
+              const mirrored = await find_mirrored_issue();
+              if (mirrored) {
+                await github.rest.issues.createComment({
+                  owner: private_owner,
+                  repo: private_repo,
+                  issue_number: mirrored.number,
+                  body: [
+                    `> Comment from [@${comment.user.login}](${comment.user.html_url}) on [#${issue.number}](${issue.html_url})`,
+                    '',
+                    comment.body
+                  ].join('\n')
+                });
+              }
+            }
