@@ -1,75 +1,143 @@
 name: Sync Issues to Private Repo
 
 on:
-  issues:
-    types: [opened, edited, closed, reopened, labeled, unlabeled]
-  issue_comment:
-    types: [created, edited]
+  schedule:
+    - cron: '0 * * * *' # every hour
+  workflow_dispatch: # allow manual runs
+
+permissions:
+  contents: write  # needed to update .github/last_sync
+  issues: read
 
 jobs:
   sync:
     runs-on: ubuntu-latest
     steps:
-      - name: Mirror issue to private repo
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Sync issues
         uses: actions/github-script@v7
         with:
           github-token: ${{ secrets.PRIVATE_REPO_PAT }}
           script: |
+            const fs = require('fs');
             const private_owner = context.repo.owner;
             const private_repo = 'typed_graph';
-            const { issue, comment } = context.payload;
+            const sync_file = '.github/last_sync';
 
-            const mirror_tag = `[Public #${issue.number}]`;
+            // Read last sync timestamp, default to epoch if first run
+            let since = '1970-01-01T00:00:00Z';
+            if (fs.existsSync(sync_file)) {
+              since = fs.readFileSync(sync_file, 'utf8').trim();
+            }
+            const now = new Date().toISOString();
 
-            async function find_mirrored_issue() {
+            // Fetch issues updated since last run
+            const updated_issues = await github.paginate(github.rest.issues.listForRepo, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'all',
+              since,
+              per_page: 100
+            });
+
+            if (updated_issues.length === 0) {
+              console.log('No new or updated issues since', since);
+            }
+
+            async function ensure_label() {
+              try {
+                await github.rest.issues.getLabel({
+                  owner: private_owner,
+                  repo: private_repo,
+                  name: 'tgi'
+                });
+              } catch {
+                await github.rest.issues.createLabel({
+                  owner: private_owner,
+                  repo: private_repo,
+                  name: 'tgi',
+                  color: '0075ca',
+                  description: 'Reported via typed_graph_issues'
+                });
+              }
+            }
+
+            async function find_mirrored_issue(issue_url) {
               const result = await github.rest.search.issuesAndPullRequests({
-                q: `${mirror_tag} repo:${private_owner}/${private_repo} is:issue in:title`
+                q: `${issue_url} repo:${private_owner}/${private_repo} is:issue in:body`
               });
               return result.data.total_count > 0 ? result.data.items[0] : null;
             }
 
-            if (context.eventName === 'issues') {
+            await ensure_label();
+
+            for (const issue of updated_issues) {
+              // Skip pull requests
+              if (issue.pull_request) continue;
+
               const body = [
-                `> Mirrored from public issue [#${issue.number}](${issue.html_url}) by [@${issue.user.login}](${issue.user.html_url})`,
-                '',
+                `<!-- public_issue:${issue.html_url} -->`,
                 issue.body || ''
               ].join('\n');
 
-              const mirrored = await find_mirrored_issue();
+              const mirrored = await find_mirrored_issue(issue.html_url);
 
               if (!mirrored) {
+                console.log(`Creating mirror for issue #${issue.number}: ${issue.title}`);
                 await github.rest.issues.create({
                   owner: private_owner,
                   repo: private_repo,
-                  title: `${mirror_tag} ${issue.title}`,
+                  title: issue.title,
                   body,
-                  labels: issue.labels.map(l => l.name)
+                  labels: ['tgi', ...issue.labels.map(l => l.name)]
                 });
               } else {
+                console.log(`Updating mirror for issue #${issue.number}: ${issue.title}`);
                 await github.rest.issues.update({
                   owner: private_owner,
                   repo: private_repo,
                   issue_number: mirrored.number,
-                  title: `${mirror_tag} ${issue.title}`,
+                  title: issue.title,
                   body,
                   state: issue.state,
-                  labels: issue.labels.map(l => l.name)
+                  labels: ['tgi', ...issue.labels.map(l => l.name)]
                 });
+              }
+
+              // Sync comments updated since last run
+              const comments = await github.paginate(github.rest.issues.listComments, {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issue.number,
+                since,
+                per_page: 100
+              });
+
+              if (mirrored) {
+                for (const comment of comments) {
+                  await github.rest.issues.createComment({
+                    owner: private_owner,
+                    repo: private_repo,
+                    issue_number: mirrored.number,
+                    body: [
+                      `> [@${comment.user.login}](${comment.user.html_url}):`,
+                      '',
+                      comment.body
+                    ].join('\n')
+                  });
+                }
               }
             }
 
-            if (context.eventName === 'issue_comment') {
-              const mirrored = await find_mirrored_issue();
-              if (mirrored) {
-                await github.rest.issues.createComment({
-                  owner: private_owner,
-                  repo: private_repo,
-                  issue_number: mirrored.number,
-                  body: [
-                    `> Comment from [@${comment.user.login}](${comment.user.html_url}) on [#${issue.number}](${issue.html_url})`,
-                    '',
-                    comment.body
-                  ].join('\n')
-                });
-              }
-            }
+            // Write updated timestamp
+            fs.writeFileSync(sync_file, now);
+
+      - name: Commit last sync timestamp
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add .github/last_sync
+          git diff --staged --quiet || git commit -m "chore: update last sync timestamp"
+          git push
