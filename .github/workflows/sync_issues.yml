@@ -2,7 +2,9 @@ name: Sync Issues to Private Repo
 
 on:
   schedule:
-    - cron: '0 * * * *' # every hour
+    - cron: '0 12 * * *'  # 4am PST
+    - cron: '0 20 * * *'  # 12pm PST
+    - cron: '0 2 * * *'   # 6pm PST
   workflow_dispatch: # allow manual runs
 
 permissions:
